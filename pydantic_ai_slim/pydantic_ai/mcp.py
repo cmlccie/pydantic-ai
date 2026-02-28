@@ -16,6 +16,7 @@ from typing import Annotated, Any, overload
 import anyio
 import httpx
 import pydantic_core
+from anyio.abc import TaskGroup, TaskStatus
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import AnyUrl, BaseModel, Discriminator, Field, Tag
 from pydantic_core import CoreSchema, core_schema
@@ -363,9 +364,9 @@ class MCPServer(AbstractToolset[Any], ABC):
 
     _enter_lock: Lock = field(compare=False)
     _running_count: int
-    _exit_stack: AsyncExitStack | None
+    _tg: TaskGroup | None
 
-    _client: ClientSession
+    _client: ClientSession | None
     _read_stream: MemoryObjectReceiveStream[SessionMessage | Exception]
     _write_stream: MemoryObjectSendStream[SessionMessage]
     _server_info: mcp_types.Implementation
@@ -415,7 +416,8 @@ class MCPServer(AbstractToolset[Any], ABC):
     def __post_init__(self):
         self._enter_lock = Lock()
         self._running_count = 0
-        self._exit_stack = None
+        self._tg = None
+        self._client = None
         self._cached_tools = None
         self._cached_resources = None
 
@@ -492,6 +494,7 @@ class MCPServer(AbstractToolset[Any], ABC):
             return self._cached_tools
 
         async with self:
+            assert self._client is not None
             result = await self._client.list_tools()
             if self.cache_tools:
                 self._cached_tools = result.tools
@@ -517,6 +520,7 @@ class MCPServer(AbstractToolset[Any], ABC):
             ModelRetry: If the tool call fails.
         """
         async with self:  # Ensure server is running
+            assert self._client is not None
             try:
                 result = await self._client.send_request(
                     mcp_types.ClientRequest(
@@ -614,6 +618,7 @@ class MCPServer(AbstractToolset[Any], ABC):
             return self._cached_resources
 
         async with self:
+            assert self._client is not None
             if not self.capabilities.resources:
                 return []
             try:
@@ -632,6 +637,7 @@ class MCPServer(AbstractToolset[Any], ABC):
             MCPError: If the server returns an error.
         """
         async with self:  # Ensure server is running
+            assert self._client is not None
             if not self.capabilities.resources:
                 return []
             try:
@@ -665,6 +671,7 @@ class MCPServer(AbstractToolset[Any], ABC):
         """
         resource_uri = uri if isinstance(uri, str) else uri.uri
         async with self:  # Ensure server is running
+            assert self._client is not None
             try:
                 result = await self._client.read_resource(AnyUrl(resource_uri))
             except mcp_exceptions.McpError as e:
@@ -676,31 +683,51 @@ class MCPServer(AbstractToolset[Any], ABC):
             else [self._get_content(resource) for resource in result.contents]
         )
 
-    async def __aenter__(self) -> Self:
-        """Enter the MCP server context.
+    async def serve(self, *, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
+        """Run the MCP server connection as a long-lived task.
 
-        This will initialize the connection to the server.
-        If this server is an [`MCPServerStdio`][pydantic_ai.mcp.MCPServerStdio], the server will first be started as a subprocess.
+        This is the recommended pattern for shared MCP servers in concurrent contexts
+        (parallel evals, concurrent ``agent.run()`` calls, etc.). Use with
+        :meth:`anyio.abc.TaskGroup.start` to start the connection and wait for it to be ready:
 
-        This is a no-op if the MCP server has already been entered.
+        ```python {test="skip"}
+        import anyio
+
+        from pydantic_ai.mcp import MCPServerStdio
+
+        mcp_server = MCPServerStdio('python', ['-m', 'my_mcp_server'])
+
+        async def main() -> None:
+            async with anyio.create_task_group() as tg:
+                await tg.start(mcp_server.serve)
+                # server is now ready; cancel the scope when done
+                ...
+                tg.cancel_scope.cancel()
+        ```
+
+        Once running via ``serve()``, subsequent ``async with mcp_server:`` calls become
+        no-ops that share the existing connection.
+
+        Args:
+            task_status: Used to signal readiness via ``task_status.started()``.
+                Defaults to :data:`anyio.TASK_STATUS_IGNORED`.
         """
-        async with self._enter_lock:
-            if self._running_count == 0:
-                async with AsyncExitStack() as exit_stack:
-                    self._read_stream, self._write_stream = await exit_stack.enter_async_context(self.client_streams())
-
-                    client = ClientSession(
-                        read_stream=self._read_stream,
-                        write_stream=self._write_stream,
-                        sampling_callback=self._sampling_callback if self.allow_sampling else None,
-                        elicitation_callback=self.elicitation_callback,
-                        logging_callback=self.log_handler,
-                        read_timeout_seconds=timedelta(seconds=self.read_timeout),
-                        message_handler=self._handle_notification,
-                        client_info=self.client_info,
-                    )
-                    self._client = await exit_stack.enter_async_context(client)
-
+        async with self.client_streams() as (read_stream, write_stream):
+            self._read_stream = read_stream
+            self._write_stream = write_stream
+            client = ClientSession(
+                read_stream=read_stream,
+                write_stream=write_stream,
+                sampling_callback=self._sampling_callback if self.allow_sampling else None,
+                elicitation_callback=self.elicitation_callback,
+                logging_callback=self.log_handler,
+                read_timeout_seconds=timedelta(seconds=self.read_timeout),
+                message_handler=self._handle_notification,
+                client_info=self.client_info,
+            )
+            async with client:
+                self._client = client
+                try:
                     with anyio.fail_after(self.timeout):
                         result = await self._client.initialize()
                         self._server_info = result.serverInfo
@@ -708,8 +735,35 @@ class MCPServer(AbstractToolset[Any], ABC):
                         self._instructions = result.instructions
                         if log_level := self.log_level:
                             await self._client.set_logging_level(log_level)
+                    task_status.started()
+                    await anyio.sleep_forever()
+                finally:
+                    self._client = None
+                    self._cached_tools = None
+                    self._cached_resources = None
 
-                    self._exit_stack = exit_stack.pop_all()
+    async def __aenter__(self) -> Self:
+        """Enter the MCP server context.
+
+        This will initialize the connection to the server.
+        If this server is an [`MCPServerStdio`][pydantic_ai.mcp.MCPServerStdio], the server will first be started as a subprocess.
+
+        This is a no-op if the MCP server has already been entered or if [`serve`][pydantic_ai.mcp.MCPServer.serve] is already running.
+        """
+        async with self._enter_lock:
+            if self._client is not None:
+                # Already running via serve() or a prior __aenter__ — no lifecycle to manage
+                self._running_count += 1
+                return self
+            if self._running_count == 0:
+                self._tg = anyio.create_task_group()
+                await self._tg.__aenter__()
+                try:
+                    await self._tg.start(self.serve)
+                except BaseException:
+                    await self._tg.__aexit__(None, None, None)
+                    self._tg = None
+                    raise
             self._running_count += 1
         return self
 
@@ -718,11 +772,10 @@ class MCPServer(AbstractToolset[Any], ABC):
             raise ValueError('MCPServer.__aexit__ called more times than __aenter__')
         async with self._enter_lock:
             self._running_count -= 1
-            if self._running_count == 0 and self._exit_stack is not None:
-                await self._exit_stack.aclose()
-                self._exit_stack = None
-                self._cached_tools = None
-                self._cached_resources = None
+            if self._running_count == 0 and self._tg is not None:
+                self._tg.cancel_scope.cancel()
+                await self._tg.__aexit__(None, None, None)
+                self._tg = None
 
     @property
     def is_running(self) -> bool:

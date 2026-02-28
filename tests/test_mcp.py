@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import anyio
 import pytest
 
 from pydantic_ai import (
@@ -2403,3 +2404,92 @@ async def test_server_capabilities_list_changed_fields() -> None:
         assert isinstance(caps.prompts_list_changed, bool)
         assert isinstance(caps.tools_list_changed, bool)
         assert isinstance(caps.resources_list_changed, bool)
+
+
+async def test_serve_with_task_group() -> None:
+    """Test that serve() starts the server in a task group child task and signals readiness."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+
+    async with anyio.create_task_group() as tg:
+        await tg.start(server.serve)
+        # Server is ready: _client is set, tools are accessible
+        assert server._client is not None  # pyright: ignore[reportPrivateUsage]
+        tools = await server.list_tools()
+        assert len(tools) > 0
+        tg.cancel_scope.cancel()
+
+    # After TG exits, serve() cleanup has run
+    assert server._client is None  # pyright: ignore[reportPrivateUsage]
+    assert server._cached_tools is None  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_serve_then_context_manager_noop() -> None:
+    """Test that async with server: is a no-op when serve() is already running."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+
+    async with anyio.create_task_group() as tg:
+        await tg.start(server.serve)
+
+        assert server._client is not None  # pyright: ignore[reportPrivateUsage]
+        assert server._running_count == 0  # pyright: ignore[reportPrivateUsage]
+
+        # async with server: should be a no-op (just bumps count)
+        async with server:
+            assert server._running_count == 1  # pyright: ignore[reportPrivateUsage]
+            tools = await server.list_tools()
+            assert len(tools) > 0
+
+        # After exiting the inner context, _client is still set (serve() still running)
+        assert server._running_count == 0  # pyright: ignore[reportPrivateUsage]
+        assert server._client is not None  # pyright: ignore[reportPrivateUsage]
+
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.vcr
+async def test_concurrent_mcp_server_enter_exit() -> None:
+    """Test that concurrent tasks can share an MCP server via an outer async with context.
+
+    This verifies the recommended pattern for concurrent usage: wrap all concurrent tasks
+    in an outer ``async with server:`` so that all transport cancel scopes are managed
+    in the same task (avoiding cross-task cancel scope errors).
+    """
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    tool_counts: list[int] = []
+
+    async def use_server() -> None:
+        async with server:  # no-op: outer context already active
+            tools = await server.list_tools()
+            tool_counts.append(len(tools))
+
+    async with server:  # outer context owns the connection lifecycle
+        async with anyio.create_task_group() as tg:
+            for _ in range(5):
+                tg.start_soon(use_server)
+
+    assert len(tool_counts) == 5
+    assert all(count > 0 for count in tool_counts)
+
+
+@pytest.mark.vcr
+async def test_concurrent_agent_runs_with_mcp(allow_model_requests: None) -> None:
+    """Test that concurrent agent.run() calls work with a shared MCP server.
+
+    Uses an outer ``async with agent:`` to keep the MCP server connection alive
+    for the duration of all concurrent runs.
+    """
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    agent = Agent(model=TestModel(call_tools=['celsius_to_fahrenheit']), toolsets=[server])
+    outputs: list[str] = []
+
+    async def run_agent() -> None:
+        async with agent:  # no-op: outer context already active
+            result = await agent.run('convert 100 celsius to fahrenheit')
+            outputs.append(result.output)
+
+    async with agent:  # outer context owns the connection lifecycle
+        async with anyio.create_task_group() as tg:
+            for _ in range(5):
+                tg.start_soon(run_agent)
+
+    assert len(outputs) == 5
