@@ -368,6 +368,7 @@ class MCPServer(AbstractToolset[Any], ABC):
     _enter_lock: Lock = field(compare=False)
     _running_count: int
     _tg: TaskGroup | None
+    _stop_event: anyio.Event | None
 
     _client: ClientSession | None
     _read_stream: MemoryObjectReceiveStream[SessionMessage | Exception]
@@ -420,6 +421,7 @@ class MCPServer(AbstractToolset[Any], ABC):
         self._enter_lock = Lock()
         self._running_count = 0
         self._tg = None
+        self._stop_event = None
         self._client = None
         self._cached_tools = None
         self._cached_resources = None
@@ -739,7 +741,10 @@ class MCPServer(AbstractToolset[Any], ABC):
                         if log_level := self.log_level:
                             await self._client.set_logging_level(log_level)
                     task_status.started()
-                    await anyio.sleep_forever()
+                    if self._stop_event is not None:
+                        await self._stop_event.wait()
+                    else:
+                        await anyio.sleep_forever()
                 finally:
                     self._client = None
                     self._cached_tools = None
@@ -759,6 +764,7 @@ class MCPServer(AbstractToolset[Any], ABC):
                 self._running_count += 1
                 return self
             if self._running_count == 0:
+                self._stop_event = anyio.Event()
                 self._tg = anyio.create_task_group()
                 await self._tg.__aenter__()
                 try:
@@ -766,6 +772,7 @@ class MCPServer(AbstractToolset[Any], ABC):
                 except BaseException:
                     await self._tg.__aexit__(None, None, None)
                     self._tg = None
+                    self._stop_event = None
                     raise
             self._running_count += 1
         return self
@@ -776,12 +783,14 @@ class MCPServer(AbstractToolset[Any], ABC):
         async with self._enter_lock:
             self._running_count -= 1
             if self._running_count == 0 and self._tg is not None:
-                self._tg.cancel_scope.cancel()
+                if self._stop_event is not None:
+                    self._stop_event.set()
                 try:
                     await self._tg.__aexit__(None, None, None)
                 except BaseException as e:
                     logger.warning('Error during MCP server shutdown (ignored): %s', e)
                 self._tg = None
+                self._stop_event = None
 
     @property
     def is_running(self) -> bool:
