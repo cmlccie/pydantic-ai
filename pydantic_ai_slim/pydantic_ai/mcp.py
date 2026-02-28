@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import re
 import warnings
@@ -59,6 +60,8 @@ __all__ = (
     'ResourceTemplate',
     'ServerCapabilities',
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MCPError(RuntimeError):
@@ -774,7 +777,10 @@ class MCPServer(AbstractToolset[Any], ABC):
             self._running_count -= 1
             if self._running_count == 0 and self._tg is not None:
                 self._tg.cancel_scope.cancel()
-                await self._tg.__aexit__(None, None, None)
+                try:
+                    await self._tg.__aexit__(None, None, None)
+                except BaseException as e:
+                    logger.warning('Error during MCP server shutdown (ignored): %s', e)
                 self._tg = None
 
     @property
